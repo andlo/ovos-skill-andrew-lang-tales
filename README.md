@@ -15,6 +15,19 @@ _"These fairy tales are the oldest stories in the world."_
 > so you also need **ovos-common-reading-pipeline-plugin** installed and
 > added to your pipeline config for it to be useful at all.
 
+> **English only, no translation.** Unlike `ovos-skill-andersen-tales`/
+> `ovos-skill-grimm-tales` (real per-language sources) or
+> `ovos-skill-ovosblog`/`ovos-skill-arxiv-papers` (machine-translated),
+> this provider has **no non-English content and does not attempt to
+> translate** - the stories themselves are long, literary prose, where
+> per-request machine translation is both expensive and a much bigger
+> quality risk than translating a short blog post or paper abstract (see
+> [ovos-common-reading-pipeline-plugin#5](https://github.com/andlo/ovos-common-reading-pipeline-plugin/issues/5)
+> for the reasoning). **Your OVOS device's language needs to be set to
+> English (`en-*`) to get good results from this provider** - on other
+> languages, matching against these English-only titles won't work well
+> and stories will still be read in English regardless.
+
 ## Install
 ```bash
 pip install ovos-skill-andrew-lang-tales ovos-common-reading-pipeline-plugin
@@ -38,6 +51,15 @@ The index was built once via `scripts/build_lang_index.py`, which:
 - Repairs anchors for books Gutenberg has since re-published with a
   different scheme (Red and Brown Fairy Books)
 - Validates every entry actually extracts real text before including it
+
+## Languages
+
+**English only.** Andrew Lang's Fairy Books are sourced from Project
+Gutenberg in English; no other language editions exist for this
+collection, and this provider makes no attempt to machine-translate (see
+the note above). A search from a non-English device falls back to
+matching against the English index, so results will be poor and stories
+will be read in English regardless of the device's configured language.
 
 ## Collection hints
 

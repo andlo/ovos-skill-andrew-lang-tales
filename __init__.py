@@ -93,8 +93,10 @@ class AndrewLangTales(OVOSSkill):
         lang = self.lang
         path = self._index_path_for_lang(lang)
         if not os.path.isfile(path):
-            # only English is curated so far (see README) - fall back
-            # rather than offering nothing at all
+            # only en-us is bundled - this fallback is just for other
+            # English variants (en-gb, en-au, ...), NOT a "serve English
+            # to anyone" mechanism. handle_search separately refuses to
+            # respond at all for non-English devices (see its docstring).
             self.log.warning(f"no bundled index for '{lang}', falling back to en-us")
             path = self._index_path_for_lang("en-us")
         if not os.path.isfile(path):
@@ -166,6 +168,14 @@ class AndrewLangTales(OVOSSkill):
 
     def handle_search(self, message):
         if not self.index:
+            return
+        if self.lang.split("-")[0] != "en":
+            # English-only content, no translation attempted (see
+            # README) - reading English prose aloud with a non-English
+            # TTS voice would sound wrong, and OVOS doesn't reliably pick
+            # a matching voice per-utterance even if the dialog text
+            # itself gets machine-translated by an audio-layer
+            # transformer. Stay silent rather than risk that.
             return
         collection_hint = message.data.get("collection_hint")
         if not self._matches_collection_hint(collection_hint):

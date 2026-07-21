@@ -1,7 +1,8 @@
 """Tests for the ovos.common_reading.* bus protocol handlers."""
 from unittest.mock import MagicMock
 
-from conftest import COMMON_READING_SEARCH_RESPONSE, COMMON_READING_FETCH_CONTENT_RESPONSE, StoryFetchError
+import pytest
+from conftest import AndrewLangTales, COMMON_READING_SEARCH_RESPONSE, COMMON_READING_FETCH_CONTENT_RESPONSE, StoryFetchError
 
 
 def make_message(data=None):
@@ -40,6 +41,30 @@ def test_handle_search_stays_silent_on_empty_index(skill):
     skill.index = {}
     skill.handle_search(make_message({"phrase": "anything"}))
     skill.bus.emit.assert_not_called()
+
+
+def test_handle_search_stays_silent_for_non_english_device(skill, monkeypatch):
+    """English-only content, no translation - a non-English device gets
+    silence, not a mismatched-language response (see README)."""
+    monkeypatch.setattr(AndrewLangTales, "lang", "da-dk", raising=False)
+    skill.index = _sample_index()
+    skill.handle_search(make_message({"phrase": "cinderella"}))
+    skill.bus.emit.assert_not_called()
+
+
+def test_handle_search_stays_silent_for_non_english_even_with_collection_hint(skill, monkeypatch):
+    monkeypatch.setattr(AndrewLangTales, "lang", "de-de", raising=False)
+    skill.index = _sample_index()
+    skill.handle_search(make_message({"phrase": None, "collection_hint": "andrew lang"}))
+    skill.bus.emit.assert_not_called()
+
+
+@pytest.mark.parametrize("lang", ["en-us", "en-gb", "en-au"])
+def test_handle_search_responds_for_any_english_variant(skill, monkeypatch, lang):
+    monkeypatch.setattr(AndrewLangTales, "lang", lang, raising=False)
+    skill.index = _sample_index()
+    skill.handle_search(make_message({"phrase": "cinderella"}))
+    skill.bus.emit.assert_called_once()
 
 
 def test_handle_search_stays_silent_when_collection_hint_does_not_match(skill):

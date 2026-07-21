@@ -24,9 +24,9 @@ _"These fairy tales are the oldest stories in the world."_
 > quality risk than translating a short blog post or paper abstract (see
 > [ovos-common-reading-pipeline-plugin#5](https://github.com/andlo/ovos-common-reading-pipeline-plugin/issues/5)
 > for the reasoning). **Your OVOS device's language needs to be set to
-> English (`en-*`) to get good results from this provider** - on other
-> languages, matching against these English-only titles won't work well
-> and stories will still be read in English regardless.
+> English (`en-*`) to use this provider at all** - on any other
+> language, it stays silent rather than serve English content that
+> would read aloud with the wrong voice.
 
 ## Install
 ```bash
@@ -57,9 +57,11 @@ The index was built once via `scripts/build_lang_index.py`, which:
 **English only.** Andrew Lang's Fairy Books are sourced from Project
 Gutenberg in English; no other language editions exist for this
 collection, and this provider makes no attempt to machine-translate (see
-the note above). A search from a non-English device falls back to
-matching against the English index, so results will be poor and stories
-will be read in English regardless of the device's configured language.
+the note above). **A search from a non-English device gets no response
+at all** - this provider stays silent rather than serve English content
+a Danish/German/etc. device would read aloud with the wrong voice, or
+not read correctly at all. Set your OVOS device's language to English
+(`en-*`) to use this provider.
 
 ## Collection hints
 

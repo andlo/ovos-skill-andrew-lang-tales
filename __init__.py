@@ -50,12 +50,18 @@ COMMON_READING_SEARCH = "ovos.common_reading.search"
 COMMON_READING_SEARCH_RESPONSE = "ovos.common_reading.search.response"
 COMMON_READING_FETCH_CONTENT = "ovos.common_reading.fetch_content"  # + ".{this_skill_id}"
 COMMON_READING_FETCH_CONTENT_RESPONSE = "ovos.common_reading.fetch_content.response"
+COMMON_READING_PING = "ovos.common_reading.ping"
+COMMON_READING_PONG = "ovos.common_reading.pong"
 
 COLLECTION_ALIASES = ["andrew lang", "lang", "the fairy books", "the coloured fairy books",
                        "lang's fairy books"]
 COLLECTION_HINT_THRESHOLD = 0.85  # see ovos-common-reading-pipeline-plugin's README for why not lower
 CONTENT_TYPES = ["story", "tale"]
 SOURCE_NAME = "Project Gutenberg"
+# each story's own 'collection' in search responses is its specific book
+# (e.g. 'The Blue Fairy Book'), taken from the bundled index - but pong
+# needs one umbrella name for the whole provider, not a per-story one
+COLLECTION_NAME = "Andrew Lang's Fairy Books"
 
 # Andrew Lang's Fairy Books are only sourced in English (see README) and
 # this provider does NOT translate (unlike ovos-skill-ovosblog/
@@ -102,6 +108,7 @@ class AndrewLangTales(OVOSSkill):
             self.log.error("No bundled story index found for this language")
         self.add_event(COMMON_READING_SEARCH, self.handle_search)
         self.add_event(f"{COMMON_READING_FETCH_CONTENT}.{self.skill_id}", self.handle_fetch_content)
+        self.add_event(COMMON_READING_PING, self.handle_ping)
 
     def _index_path_for_lang(self, lang):
         return os.path.join(os.path.dirname(__file__), "locale", lang, "index.json")
@@ -228,3 +235,15 @@ class AndrewLangTales(OVOSSkill):
             self.bus.emit(message.reply(COMMON_READING_FETCH_CONTENT_RESPONSE, {"paragraphs": []}))
             return
         self.bus.emit(message.reply(COMMON_READING_FETCH_CONTENT_RESPONSE, {"paragraphs": paragraphs}))
+
+    def handle_ping(self, message):
+        """Cheap 'is anyone there?' reply - no index lookup. Only ever
+        called by the pipeline plugin on its rare 0-candidates path
+        (see ovos-common-reading-pipeline-plugin#2), never on every
+        search. A non-English device never reaches this handler at all,
+        since initialize() returned early and never registered it -
+        which is exactly the right behavior."""
+        self.bus.emit(message.reply(COMMON_READING_PONG, {
+            "skill_id": self.skill_id,
+            "collection": COLLECTION_NAME,
+        }))

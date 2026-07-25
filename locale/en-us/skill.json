@@ -9,8 +9,7 @@
   "description": "Andrew Lang's Fairy Books provider for ovos-common-reading-pipeline-plugin. No standalone voice interface.",
   "examples": [
     "Tell me a story from andrew lang",
-    "Read me a fairy tale from the fairy books",
-    "Tell me a story from lang"
+    "Tell me a fairy tale from the fairy books"
   ],
   "tags": [
     "entertainment",

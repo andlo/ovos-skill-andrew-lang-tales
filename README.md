@@ -23,9 +23,9 @@ _"These fairy tales are the oldest stories in the world."_
 > per-request machine translation is both expensive and a much bigger
 > quality risk than translating a short blog post or paper abstract (see
 > [ovos-common-reading-pipeline-plugin#5](https://github.com/andlo/ovos-common-reading-pipeline-plugin/issues/5)
-> for the reasoning). **Your OVOS device's language needs to be set to
-> English (`en-*`) to use this provider at all** - on any other
-> language, the skill **never loads** (see "Languages" below).
+> for the reasoning). **It answers searches made in English (`en-*`)
+> and stays silent for every other language**, whatever the device's
+> own language is (see "Languages" below).
 
 ## Install
 ```bash
@@ -56,12 +56,31 @@ The index was built once via `scripts/build_lang_index.py`, which:
 **English only.** Andrew Lang's Fairy Books are sourced from Project
 Gutenberg in English; no other language editions exist for this
 collection, and this provider makes no attempt to machine-translate (see
-the note above). **On any other device language, this provider never
-loads at all**: `initialize()` checks the device's language against
-`SUPPORTED_LANGUAGES = {"en"}` before loading the index or registering
-any bus events, and logs a clear message explaining why, rather than
-loading fully and declining searches at runtime. Set your OVOS device's
-language to English (`en-*`) to use this provider.
+the note above).
+
+The provider always loads, and decides **per search** whether to answer:
+a search made in English gets an answer, any other language gets none.
+The language of a search is the pipeline plugin's `lang` field, else the
+language of the session the search came from, else (an older plugin
+sends neither) the device's own language. That matters on a HiveMind
+hub, where one ovos-core serves many users at once, each session in its
+own language: a French session must not get English stories, and an
+English session must still get them on a hub whose own language is
+French. A `ping` that names a language (the same way) only gets a pong
+when that is English. Fetching a story is never gated on language - it
+is addressed to this provider directly.
+
+## Title matching
+
+Titles match regardless of case, accents, punctuation, a leading
+article and a leading "Story Of" / "History Of" / "Tale Of", so "the six
+swans" finds *The Six Swans* and "the three bears" finds *The Story Of
+The Three Bears* at full confidence. For "X, Or Y" titles each half
+counts too, slightly below the whole title: "cinderella" finds
+*Cinderella, Or The Little Glass Slipper* and "puss in boots" *The
+Master Cat; Or, Puss In Boots*. A search that names no title at all
+("tell me a story") gets one random story at confidence 0.9, or 1.0
+when it named this collection.
 
 ## Collection hints
 

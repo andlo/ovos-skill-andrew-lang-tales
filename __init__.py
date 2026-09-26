@@ -30,15 +30,19 @@ actually fetching a specific story's text from Project Gutenberg.
 """
 
 from ovos_workshop.skills import OVOSSkill
-from ovos_utils.parse import match_one
+from ovos_bus_client.session import SessionManager
+from ovos_utils.parse import match_one, fuzzy_match
 from ovos_utils import classproperty
 from ovos_utils.process_utils import RuntimeRequirements
 
 import requests
 from bs4 import BeautifulSoup
+from functools import lru_cache
 import json
 import os
 import random
+import re
+import unicodedata
 
 
 class StoryFetchError(Exception):
@@ -65,9 +69,121 @@ COLLECTION_NAME = "Andrew Lang's Fairy Books"
 
 # Andrew Lang's Fairy Books are only sourced in English (see README) and
 # this provider does NOT translate (unlike ovos-skill-ovosblog/
-# ovos-skill-arxiv-papers) - a device set to any other language gets no
-# response at all, decided once at load time (see initialize()).
+# ovos-skill-arxiv-papers) - it answers searches made in English and stays
+# silent for every other language. That is decided per request, not once
+# from the device's language: on a HiveMind hub one ovos-core serves many
+# users at once, each session in its own language, so the provider always
+# loads and looks at the language each search was made in (see
+# _request_lang()).
 SUPPORTED_LANGUAGES = {"en"}
+
+# 'tell me a story' names no title: answer with a random one, confident
+# enough to be read without an "is it that one?" round trip (the plugin
+# asks below 0.8) but below the 1.0 of a title somebody actually named
+RANDOM_STORY_CONFIDENCE = 0.9
+
+# title matching ignores case, accents, punctuation, a leading article
+# and a leading "story of"-style prefix, on both the request and the
+# title - 'the story of the three bears', 'three bears' and 'The Story
+# Of The Three Bears' all compare as 'three bears'
+LEADING_ARTICLES = ("the", "a", "an")
+TITLE_PREFIXES = ("story of", "history of", "tale of")
+AND_WORD = "and"  # what '&' is read as
+OR_WORD = "or"    # 'Cinderella, Or The Little Glass Slipper'
+# a half of an 'X, or Y' title, or the part before its first comma, is
+# how people usually ask for it ('cinderella', 'puss in boots') - trusted
+# a little less than the whole title, so a provider holding a story that
+# is called exactly that still wins
+PARTIAL_TITLE_WEIGHT = 0.95
+# words that say nothing about which title was meant, half the titles
+# have them ('the fox and the wolf' is told apart by 'fox' and 'wolf')
+FILLER_WORDS = set(LEADING_ARTICLES) | {"and", "or", "of", "in", "on", "to", "with", "for"}
+# two words are the same word when they are at least this alike
+# ('grettel'/'gretel', 'rumpelstiltzkin'/'rumpelstiltskin')
+SAME_WORD_THRESHOLD = 0.9
+
+
+def primary_subtag(lang):
+    """'en-US', 'en_gb', 'EN' -> 'en'."""
+    return (lang or "").replace("_", "-").split("-")[0].lower()
+
+
+def title_words(text):
+    """Casefolded words, accents and punctuation dropped, '&' read as
+    AND_WORD."""
+    text = unicodedata.normalize("NFKD", text.casefold().replace("&", f" {AND_WORD} "))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[\W_]+", " ", text).split()
+
+
+def normalize_title(text):
+    """Reduce a title (or what somebody asked for) to what matters for
+    matching: its title_words(), without a leading article or one of
+    TITLE_PREFIXES."""
+    words = title_words(text)
+
+    def drop_article(words):
+        return words[1:] if len(words) > 1 and words[0] in LEADING_ARTICLES else words
+
+    words = drop_article(words)
+    for prefix in TITLE_PREFIXES:
+        prefix = title_words(prefix)
+        if len(words) > len(prefix) and words[:len(prefix)] == prefix:
+            words = drop_article(words[len(prefix):])
+            break
+    return " ".join(words)
+
+
+def significant_words(title):
+    """The words of a normalized title that say which title it is -
+    FILLER_WORDS are shared by half the titles and say nothing, unless
+    the title has nothing else."""
+    words = title.split()
+    return [w for w in words if w not in FILLER_WORDS] or words
+
+
+def same_word(a, b):
+    if a == b:
+        return True
+    # a ratio can never beat the length ratio - skip the ones that cannot
+    # make it before paying for the comparison
+    if 2 * min(len(a), len(b)) < SAME_WORD_THRESHOLD * (len(a) + len(b)):
+        return False
+    return fuzzy_match(a, b) >= SAME_WORD_THRESHOLD
+
+
+def title_similarity(wanted, alias):
+    """How alike two normalized titles are, 0.0-1.0: the letter-level
+    ratio averaged with the share of words that have a close match on the
+    other side. Letters alone are too generous with short titles - 'frog
+    prince' and 'strong prince' are 0.83 alike letter by letter but share
+    only one of their two words (0.67 together). Spaces do not count
+    ('bluebeard' is 'Blue Beard', 'tinderbox' is 'The Tinder-Box')."""
+    if wanted.replace(" ", "") == alias.replace(" ", ""):
+        return 1.0
+    a, b = significant_words(wanted), significant_words(alias)
+    shared = sum(any(same_word(w, o) for o in b) for w in a) + \
+        sum(any(same_word(w, o) for o in a) for w in b)
+    return (fuzzy_match(wanted, alias) + shared / (len(a) + len(b))) / 2
+
+
+@lru_cache(maxsize=None)
+def title_aliases(title):
+    """Every way a title can be asked for, normalized, each with the
+    weight its match counts for: the whole title, and at
+    PARTIAL_TITLE_WEIGHT each half of an 'X, or Y' / 'X; Y' / 'X. Y'
+    title and the part before its first comma. A trailing '(From The
+    Russian)' is not part of the name at all."""
+    whole = re.sub(r"\([^)]*\)", " ", title)
+    aliases = {normalize_title(title): 1.0, normalize_title(whole): 1.0}
+    parts = re.split(rf"[;:.]|\b{OR_WORD}\b", whole, flags=re.IGNORECASE)
+    parts.append(whole.split(",")[0])
+    for part in parts:
+        alias = normalize_title(part)
+        if alias and alias not in aliases:
+            aliases[alias] = PARTIAL_TITLE_WEIGHT
+    aliases.pop("", None)
+    return tuple(aliases.items())
 
 
 class AndrewLangTales(OVOSSkill):
@@ -88,24 +204,20 @@ class AndrewLangTales(OVOSSkill):
         )
 
     def initialize(self):
-        lang = self.lang.split("-")[0]
-        if lang not in SUPPORTED_LANGUAGES:
-            self.log.info(
-                f"{self.skill_id}: device language '{self.lang}' is not "
-                f"English, and this provider (Project Gutenberg / Andrew "
-                f"Lang) has no non-English content and does not translate - "
-                f"skill will stay inert (no bus events registered, index "
-                f"not loaded)."
-            )
-            self.index = {}
-            return
+        # always loads, whatever the device language: which language a
+        # search is in is decided per request (see handle_search())
         # in-memory cache of already-fetched Gutenberg book pages
         # (BeautifulSoup), keyed by URL - several stories share the same
         # book file
         self._book_soup_cache = {}
         self.index = self._load_index()
         if not self.index:
-            self.log.error("No bundled story index found for this language")
+            self.log.error("No bundled story index found")
+        self.log.info(
+            f"{self.skill_id}: serving {len(self.index)} English stories "
+            f"to searches made in English (en-*), whatever the device "
+            f"language ('{self.lang}') is"
+        )
         self.add_event(COMMON_READING_SEARCH, self.handle_search)
         self.add_event(f"{COMMON_READING_FETCH_CONTENT}.{self.skill_id}", self.handle_fetch_content)
         self.add_event(COMMON_READING_PING, self.handle_ping)
@@ -114,15 +226,10 @@ class AndrewLangTales(OVOSSkill):
         return os.path.join(os.path.dirname(__file__), "locale", lang, "index.json")
 
     def _load_index(self):
-        lang = self.lang
-        path = self._index_path_for_lang(lang)
-        if not os.path.isfile(path):
-            # only en-us is bundled - this fallback is just for other
-            # English variants (en-gb, en-au, ...). initialize() already
-            # checked self.lang is in SUPPORTED_LANGUAGES before this is
-            # ever called, so this only ever runs for English devices.
-            self.log.warning(f"no bundled index for '{lang}', falling back to en-us")
-            path = self._index_path_for_lang("en-us")
+        # only en-us is bundled, and it is the one to load whatever the
+        # device language is - every English request (en-gb, en-au, ...)
+        # is served from it
+        path = self._index_path_for_lang("en-us")
         if not os.path.isfile(path):
             return {}
         try:
@@ -190,8 +297,44 @@ class AndrewLangTales(OVOSSkill):
             return True
         return content_type.lower() in CONTENT_TYPES
 
+    @staticmethod
+    def _request_lang(message):
+        """The language a request was made in, or None when it does not
+        say: the pipeline plugin's own 'lang' field first, then the
+        language of the session the request was forwarded from (a
+        HiveMind client's, on a hub). An older plugin sends neither."""
+        lang = message.data.get("lang") or message.context.get("lang")
+        if not lang and message.context.get("session"):
+            lang = SessionManager.get(message).lang
+        return lang or None
+
+    @staticmethod
+    def _serves(lang):
+        return primary_subtag(lang) in SUPPORTED_LANGUAGES
+
+    def _best_title(self, phrase):
+        """(title, confidence) of the story that best matches what was
+        asked for, or (None, 0.0) when the phrase is empty once
+        normalized - see normalize_title() and title_aliases()."""
+        wanted = normalize_title(phrase)
+        best, best_score = None, 0.0
+        if not wanted:
+            return best, best_score
+        for title in self.index:
+            for alias, weight in title_aliases(title):
+                score = title_similarity(wanted, alias) * weight
+                if score > best_score:
+                    best, best_score = title, score
+        return best, best_score
+
     def handle_search(self, message):
         if not self.index:
+            return
+        # a search made in any other language gets no answer at all, not
+        # an empty one - the plugin just collects whatever arrives. With
+        # no language on the request (an older plugin), the device's own
+        # language decides, as it always did.
+        if not self._serves(self._request_lang(message) or self.lang):
             return
         collection_hint = message.data.get("collection_hint")
         if not self._matches_collection_hint(collection_hint):
@@ -200,16 +343,14 @@ class AndrewLangTales(OVOSSkill):
         if not self._matches_content_type(content_type):
             return
 
-        phrase = message.data.get("phrase")
-        if phrase:
-            title, confidence = match_one(phrase, list(self.index.keys()))
-        elif collection_hint:
-            # 'a story from Andrew Lang' with no specific title named -
-            # only a sensible response if the hint was actually for us
+        phrase = (message.data.get("phrase") or "").strip()
+        title, confidence = self._best_title(phrase) if phrase else (None, 0.0)
+        if title is None:
+            # no title asked for: 'tell me a story', or 'a story from
+            # Andrew Lang' - a random one, and fully confident when the
+            # collection itself was named
             title = random.choice(list(self.index.keys()))
-            confidence = 1.0
-        else:
-            return
+            confidence = 1.0 if collection_hint else RANDOM_STORY_CONFIDENCE
 
         entry = self.index[title]
         self.bus.emit(message.reply(COMMON_READING_SEARCH_RESPONSE, {
@@ -240,9 +381,14 @@ class AndrewLangTales(OVOSSkill):
         """Cheap 'is anyone there?' reply - no index lookup. Only ever
         called by the pipeline plugin on its rare 0-candidates path
         (see ovos-common-reading-pipeline-plugin#2), never on every
-        search. A non-English device never reaches this handler at all,
-        since initialize() returned early and never registered it -
-        which is exactly the right behavior."""
+        search. A ping that says which language it is asking for (its
+        'lang' field or the session it was forwarded from) only gets a
+        pong when that is English, so the plugin can tell 'nothing
+        installed for this language' from 'found nothing'. A ping that
+        does not say is answered: this provider is installed."""
+        lang = self._request_lang(message)
+        if lang and not self._serves(lang):
+            return
         self.bus.emit(message.reply(COMMON_READING_PONG, {
             "skill_id": self.skill_id,
             "collection": COLLECTION_NAME,

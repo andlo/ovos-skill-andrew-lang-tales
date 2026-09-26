@@ -51,6 +51,28 @@ The index was built once via `scripts/build_lang_index.py`, which:
   different scheme (Red and Brown Fairy Books)
 - Validates every entry actually extracts real text before including it
 
+## Fetching and what gets read
+
+Reading a story fetches its book from Project Gutenberg once, extracts
+the text of every story in that book, and keeps it on disk under the
+skill's cache directory (`<XDG cache>/mycroft/skills/<skill_id>/`, one
+small JSON file per story). Another story from the same book, or the
+same story after a restart, needs no request. After 30 days a
+story is checked again with `If-Modified-Since`, which downloads nothing
+when the book has not changed; a change to the extractor (`CACHE_FORMAT`)
+fetches the books again. When a fetch fails, that book is not asked for
+again for five minutes, and an older copy is read meanwhile if there is
+one. When the cache directory cannot be written, the last book fetched
+is kept in memory instead. Requests say who is asking:
+`ovos-skill-andrew-lang-tales/<version> (+https://github.com/andlo/ovos-skill-andrew-lang-tales)`.
+
+What is read is the tale: paragraphs with the page's line wraps joined,
+and the rhymes line by line (they are `<pre>` blocks and used to be
+skipped). Footnotes and their numbers, the editor's note on where a tale
+came from ("Grimm.", "[From Ungarische Mährchen.]"), bare section
+numbers and Gutenberg's licence are left out. A story also ends where a
+tale the index does not have begins, instead of running on into it.
+
 ## Languages
 
 **English only.** Andrew Lang's Fairy Books are sourced from Project

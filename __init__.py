@@ -103,6 +103,12 @@ FILLER_WORDS = set(LEADING_ARTICLES) | {"and", "or", "of", "in", "on", "to", "wi
 SAME_WORD_THRESHOLD = 0.9
 
 
+def configured_languages(langs):
+    """Primary subtags of the languages an installation is configured
+    for (core lang + secondary_langs): ['en-US', 'fr-FR'] -> {'en', 'fr'}."""
+    return {primary_subtag(lang) for lang in langs or [] if lang}
+
+
 def primary_subtag(lang):
     """'en-US', 'en_gb', 'EN' -> 'en'."""
     return (lang or "").replace("_", "-").split("-")[0].lower()
@@ -204,8 +210,23 @@ class AndrewLangTales(OVOSSkill):
         )
 
     def initialize(self):
-        # always loads, whatever the device language: which language a
-        # search is in is decided per request (see handle_search())
+        # Loads only when English is one of the languages this installation
+        # is configured for: the device's own 'lang' plus 'secondary_langs'
+        # in mycroft.conf. A single English device never loads a English-only
+        # provider; a HiveMind hub serving English-speaking users lists
+        # 'en-..' in secondary_langs. Once loaded, each request's own
+        # language still decides whether it is answered (handle_search()).
+        self.served = configured_languages(self.native_langs) & SUPPORTED_LANGUAGES
+        if not self.served:
+            self.log.info(
+                f"{self.skill_id}: none of the configured languages "
+                f"{sorted(self.native_langs)} is English (en-*) - "
+                f"add it to 'secondary_langs' in mycroft.conf to serve "
+                f"English-speaking sessions. Skill stays inert (no bus "
+                f"events registered, index not loaded)."
+            )
+            self.index = {}
+            return
         # in-memory cache of already-fetched Gutenberg book pages
         # (BeautifulSoup), keyed by URL - several stories share the same
         # book file
@@ -215,8 +236,7 @@ class AndrewLangTales(OVOSSkill):
             self.log.error("No bundled story index found")
         self.log.info(
             f"{self.skill_id}: serving {len(self.index)} English stories "
-            f"to searches made in English (en-*), whatever the device "
-            f"language ('{self.lang}') is"
+            f"to searches made in English (en-*)"
         )
         self.add_event(COMMON_READING_SEARCH, self.handle_search)
         self.add_event(f"{COMMON_READING_FETCH_CONTENT}.{self.skill_id}", self.handle_fetch_content)
@@ -308,9 +328,8 @@ class AndrewLangTales(OVOSSkill):
             lang = SessionManager.get(message).lang
         return lang or None
 
-    @staticmethod
-    def _serves(lang):
-        return primary_subtag(lang) in SUPPORTED_LANGUAGES
+    def _serves(self, lang):
+        return primary_subtag(lang) in self.served
 
     def _best_title(self, phrase):
         """(title, confidence) of the story that best matches what was

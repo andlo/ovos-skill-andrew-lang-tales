@@ -24,8 +24,8 @@ _"These fairy tales are the oldest stories in the world."_
 > quality risk than translating a short blog post or paper abstract (see
 > [ovos-common-reading-pipeline-plugin#5](https://github.com/andlo/ovos-common-reading-pipeline-plugin/issues/5)
 > for the reasoning). **It answers searches made in English (`en-*`)
-> and stays silent for every other language**, whatever the device's
-> own language is (see "Languages" below).
+> and stays silent for every other language**, and only loads
+> where English is configured - the device language or `secondary_langs` (see "Languages" below).
 
 ## Install
 ```bash
@@ -58,7 +58,20 @@ Gutenberg in English; no other language editions exist for this
 collection, and this provider makes no attempt to machine-translate (see
 the note above).
 
-The provider always loads, and decides **per search** whether to answer:
+The provider loads only where English is one of the languages the
+installation is configured for: the device's own `lang`, or one of
+`secondary_langs` in `mycroft.conf`. A single device in another
+language never loads it. A HiveMind hub whose users speak English lists
+it there, even when the hub's own language is something else:
+
+```json
+{
+  "lang": "da-DK",
+  "secondary_langs": ["en-US"]
+}
+```
+
+Once loaded, it decides **per search** whether to answer:
 a search made in English gets an answer, any other language gets none.
 The language of a search is the pipeline plugin's `lang` field, else the
 language of the session the search came from, else (an older plugin

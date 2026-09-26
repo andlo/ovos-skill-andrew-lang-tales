@@ -28,6 +28,7 @@ def skill(monkeypatch):
     s._bus = MagicMock()
     s._settings = {}
     monkeypatch.setattr(AndrewLangTales, "lang", "en-us", raising=False)
+    s.served = {"en"}
     s._book_soup_cache = {}
     s.index = {}
     return s

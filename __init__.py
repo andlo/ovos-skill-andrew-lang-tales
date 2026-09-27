@@ -29,6 +29,7 @@ browsing/matching needs no internet at all. Internet is only needed when
 actually fetching a specific story's text from Project Gutenberg.
 """
 
+from ovos_config.locations import get_xdg_cache_save_path
 from ovos_workshop.skills import OVOSSkill
 from ovos_bus_client.session import SessionManager
 from ovos_utils.parse import match_one, fuzzy_match
@@ -36,12 +37,17 @@ from ovos_utils import classproperty
 from ovos_utils.process_utils import RuntimeRequirements
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from functools import lru_cache
+import gc
+import hashlib
+import importlib.metadata
 import json
 import os
 import random
 import re
+import threading
+import time
 import unicodedata
 
 
@@ -192,6 +198,275 @@ def title_aliases(title):
     return tuple(aliases.items())
 
 
+# --- fetching a story's text -------------------------------------------------
+#
+# Project Gutenberg's robot policy discourages automated access, and the
+# text of a public-domain book does not change. So a book is fetched at
+# most once per CACHE_MAX_AGE, whichever of its stories was asked for, and
+# what is kept is the text each of its stories extracts to - one small
+# file per story under the skill's XDG cache directory - never the page
+# (up to 871 KB) or its parse tree (~5 MB in memory).
+
+PYPI_NAME = "ovos-skill-andrew-lang-tales"
+REPO_URL = "https://github.com/andlo/ovos-skill-andrew-lang-tales"
+try:
+    SKILL_VERSION = importlib.metadata.version(PYPI_NAME)
+except importlib.metadata.PackageNotFoundError:  # run from a checkout
+    SKILL_VERSION = "unknown"
+# says who is asking and where to find them, instead of python-requests/x
+USER_AGENT = f"{PYPI_NAME}/{SKILL_VERSION} (+{REPO_URL})"
+FETCH_TIMEOUT = 15  # seconds
+# bump whenever a story would extract to different text, so that what an
+# older release cached is fetched again rather than read out as it was
+CACHE_FORMAT = 1
+# a story cached longer ago than this is asked for again, with the page's
+# Last-Modified - an unchanged page answers 304, without a body
+CACHE_MAX_AGE = 30 * 24 * 3600
+# a book that failed to arrive is not asked for again before this, so a
+# Gutenberg outage costs one request every few minutes, not one per story
+# asked for
+FAILURE_BACKOFF = 5 * 60
+
+
+class StoryCache:
+    """The paragraphs each story extracted to, as one small JSON file per
+    story in `directory`, named after where the story is (its book URL
+    and anchor). A file written for another CACHE_FORMAT, URL or anchor is
+    a miss. It never holds more files than the bundled index has stories.
+
+    When `directory` cannot be written, the stories of the last book
+    fetched are kept in memory instead - text only, a small part of what
+    the parsed page took - so reading still works."""
+
+    def __init__(self, directory, log):
+        self.directory = directory
+        self.log = log
+        self._memory = {}
+        self._warned = False
+
+    @staticmethod
+    def _name(url, anchor):
+        return hashlib.sha256(f"{url}#{anchor}".encode("utf-8")).hexdigest()[:32] + ".json"
+
+    def get(self, url, anchor):
+        """The cached record for a story, fresh or not, or None."""
+        name = self._name(url, anchor)
+        record = self._memory.get(name)
+        if record is None:
+            try:
+                with open(os.path.join(self.directory, name), encoding="utf-8") as f:
+                    record = json.load(f)
+            except (OSError, ValueError):
+                return None
+        if not isinstance(record, dict) or record.get("format") != CACHE_FORMAT \
+                or record.get("url") != url or record.get("anchor") != anchor \
+                or not isinstance(record.get("fetched_at"), (int, float)) \
+                or not record.get("paragraphs"):
+            return None
+        return record
+
+    @staticmethod
+    def is_fresh(record):
+        return 0 <= time.time() - record["fetched_at"] < CACHE_MAX_AGE
+
+    def put(self, records):
+        """Store the records of one book's stories."""
+        try:
+            os.makedirs(self.directory, exist_ok=True)
+            for record in records:
+                path = os.path.join(self.directory, self._name(record["url"], record["anchor"]))
+                tmp = f"{path}.{os.getpid()}.tmp"
+                try:
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(record, f, ensure_ascii=False)
+                    os.replace(tmp, path)
+                except OSError:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    raise
+        except OSError as e:
+            if not self._warned:
+                self.log.warning(f"cannot write the story cache in {self.directory} ({e}), "
+                                 f"keeping the last book fetched in memory instead")
+                self._warned = True
+            self._memory = {self._name(r["url"], r["anchor"]): r for r in records}
+
+
+# --- extracting a story's text -----------------------------------------------
+
+LINE_BREAK = "\u2028"  # what a <br> becomes, to tell it from the HTML's own wrapping
+# 'Court.(1)', 'thither. [20]': the number of a footnote, which is not
+# read, so neither is the number
+FOOTNOTE_MARKER = re.compile(r"\s*[(\[]\d{1,3}[)\]]")
+# the footnote itself: '(1) Charles Perrault.', '[6] Grimm.', '(1) Sesame
+# is a kind of grain.'
+FOOTNOTE = re.compile(r"^[(\[]\d{1,3}[)\]]")
+# '[FN#3: The spiteful fairies.]', '[Footnote: ‘Riemen.‘]': a footnote
+# some transcribers put in the middle of the sentence
+INLINE_FOOTNOTE = re.compile(r"\s*\[(?:FN#\d+|Footnote)\b[^\]]*\]")
+# a heading inside a story rather than the next story's title ('A Voyage
+# To Lilliput' has five chapters), and a section number on its own
+CHAPTER_HEADING = re.compile(r"^(?:chapter|part)\b|^[ivxlc]+\.?$", re.IGNORECASE)
+# where the book ends and Project Gutenberg's licence begins: older pages
+# have it in a <pre>, which is read now (see verse_stanzas())
+END_OF_BOOK = re.compile(r"\s*(?:\*\*\*\s*)?end of (?:the |this )?project gutenberg", re.IGNORECASE)
+# a stanza whose lines are longer than this on average is prose that the
+# transcriber happened to put in a <pre> (the rhymes average 47 or less)
+PROSE_LINE_LENGTH = 55
+# at the end of most tales (and at the start of a few) the editor names
+# where it came from, in every shape: '[From Ungarische Mährchen.]',
+# '(Japanische Marchen.)', 'From Z. Topelius.', 'By the Comte de Caylus.',
+# 'Grimm.', 'Le Prince Muguet et la Princesse Zaza.' - see is_source_note()
+BRACKETED_NOTE = re.compile(r"^[(\[].*[)\]]\.?$", re.DOTALL)
+SOURCE_NOTE = re.compile(
+    r"^(?:(?:Adapted|Taken|Translated|Shortened|Told) )?(?:[Ff]rom|[Bb]y) (?:the )?\W?[A-Z]")
+SOURCE_NOTE_MAX_WORDS = 12
+# the only words of a source's bare name that are not capitalised
+NAME_JOINING_WORDS = {"of", "the", "and", "from", "by", "et", "de", "du", "des", "la", "le",
+                      "les", "par", "von", "der", "und", "aus", "y", "por"}
+
+
+def paragraph_text(el):
+    """An element's text as it should be read. The page's own line breaks
+    are only where the transcriber's editor wrapped the HTML ('married a
+    proud\\n      woman. She had'), and a sentence splitter looking for
+    '. ' does not see a sentence end there - so every run of whitespace is
+    one space, and only a <br> (LINE_BREAK, see extract_book()) starts a
+    new line. Taken without a separator between tags, so '<i>you</i>,'
+    stays 'you,' rather than 'you ,'."""
+    lines = (" ".join(line.split()) for line in el.get_text().split(LINE_BREAK))
+    return "\n".join(line for line in lines if line)
+
+
+def verse_stanzas(text):
+    """The rhymes in a tale are <pre> blocks ('To-morrow I brew, to-day I
+    bake, ...' in Rumpelstiltzkin), which were never read at all: one
+    paragraph per stanza, one line per line of verse - unless its lines
+    are as long as prose (see PROSE_LINE_LENGTH), then it is one
+    paragraph like any other."""
+    for stanza in re.split(r"\n\s*\n", text.replace(LINE_BREAK, "\n")):
+        lines = [" ".join(line.split()) for line in stanza.split("\n")]
+        lines = [line for line in lines if line]
+        if lines:
+            prose = sum(map(len, lines)) / len(lines) > PROSE_LINE_LENGTH
+            yield (" " if prose else "\n").join(lines)
+
+
+def is_title(text):
+    """A paragraph or <pre> holding nothing but one line in capitals is
+    the title of a tale the index does not have: the Yellow Fairy Book
+    has 'THE DONKEY CABBAGE', 'THE LITTLE GREEN FROG(8)' and seven more
+    inside 'The Dragon And His Grandmother', which used to be read as
+    part of it. Not a section number, and not a shout ('‘SOMEBODY HAS
+    BEEN AT MY PORRIDGE!’')."""
+    text = text.strip()
+    return "\n" not in text and text.isupper() and not re.search(r"[!?‘“\"]", text) \
+        and not CHAPTER_HEADING.match(text)
+
+
+def clean(text):
+    """A paragraph without the footnote numbers and footnotes inside it."""
+    return INLINE_FOOTNOTE.sub("", FOOTNOTE_MARKER.sub("", text)).strip()
+
+
+def is_source_note(text):
+    """Whether a paragraph names where a tale came from rather than tells
+    it (see BRACKETED_NOTE): in brackets, or no more than
+    SOURCE_NOTE_MAX_WORDS words that start 'From ...'/'By ...' or are all
+    names ('Southey.', 'Spanish Tradition.', 'End of The Grey Fairy
+    Book.'). Never anything with a '!' or '?' in it."""
+    if "!" in text or "?" in text:
+        return False
+    if BRACKETED_NOTE.match(text):
+        return True
+    words = text.split()
+    if len(words) > SOURCE_NOTE_MAX_WORDS:
+        return False
+    if SOURCE_NOTE.match(text):
+        return True
+    for word in words:
+        word = word.strip(".,;:’‘'\"“”()[]")
+        if word and not (word[0].isupper() or word[0].isdigit() or word.lower() in NAME_JOINING_WORDS
+                         or word[:2].lower() in ("d’", "l’", "d'", "l'")):
+            return False
+    return True
+
+
+def story_paragraphs(soup, anchor, other_anchors):
+    """One story's paragraphs, from its anchor to the next story.
+    Different Gutenberg transcriptions use different anchor schemes ('<a
+    id="link...">' before the <h2> title, '<a name="link...">' nested
+    inside it, or plain '<a id="chapNN">'), so the story ends at the next
+    anchor that is a *different story in this same book* per our own index
+    (other_anchors), whatever its id/name - or at the next <h2> after the
+    story's own title that is not a chapter heading: some books have tales
+    the index leaves out, and the story before one of those used to run on
+    into it (the Brown Fairy Book's 'Which was the Foolishest?' read five
+    more) - or at a tale's title in a <pre> (see is_title()), or where the
+    book ends. Footnotes, the editor's source notes and bare section
+    numbers are left out (see FOOTNOTE, is_source_note())."""
+    anchor_tag = soup.find(id=anchor) or soup.find(attrs={"name": anchor})
+    if anchor_tag is None:
+        raise StoryFetchError(f"anchor {anchor} not found")
+    title_seen = anchor_tag.find_parent("h2") is not None
+    paragraphs = []
+    for el in anchor_tag.next_elements:
+        if not isinstance(el, Tag):
+            if END_OF_BOOK.match(el):
+                break
+            continue
+        if el.name == "a" and (el.get("id") or el.get("name")) in other_anchors:
+            break
+        if el.name == "h2":
+            if title_seen and not CHAPTER_HEADING.match(" ".join(el.get_text().split())):
+                break
+            title_seen = True
+        elif el.name == "p":
+            text = paragraph_text(el)
+            if END_OF_BOOK.match(text) or is_title(text):
+                break
+            if not FOOTNOTE.match(text):
+                paragraphs.append(clean(text))
+        elif el.name == "pre":
+            text = el.get_text()
+            if END_OF_BOOK.match(text) or is_title(text):
+                break
+            paragraphs.extend(clean(stanza) for stanza in verse_stanzas(text))
+    paragraphs = [p for p in paragraphs if p and not CHAPTER_HEADING.match(p)]
+    while paragraphs and is_source_note(paragraphs[-1]):
+        paragraphs.pop()
+    if paragraphs and BRACKETED_NOTE.match(paragraphs[0]):
+        paragraphs.pop(0)
+    if not paragraphs:
+        raise StoryFetchError(f"no story text found at anchor {anchor}")
+    return paragraphs
+
+
+def extract_book(content, anchors):
+    """Every story of one book in one go - ({anchor: paragraphs}, {anchor:
+    what went wrong}) - from the page's bytes, so the book never has to be
+    fetched again for another of its stories. Gutenberg serves these pages
+    as UTF-8 without saying so in its headers (requests then assumes
+    ISO-8859-1). The parse tree is ~5 MB of reference cycles that only the
+    cycle collector frees, so it is collected before returning (~20 ms,
+    once per book fetched) rather than whenever the collector next gets
+    to it."""
+    soup = BeautifulSoup(content, "html.parser", from_encoding="utf-8")
+    try:
+        for br in soup.find_all("br"):
+            br.replace_with(LINE_BREAK)
+        stories, errors = {}, {}
+        for anchor in anchors:
+            try:
+                stories[anchor] = story_paragraphs(soup, anchor, set(anchors) - {anchor})
+            except StoryFetchError as e:
+                errors[anchor] = str(e)
+        return stories, errors
+    finally:
+        del soup
+        gc.collect()
+
+
 class AndrewLangTales(OVOSSkill):
 
     @classproperty
@@ -227,10 +502,7 @@ class AndrewLangTales(OVOSSkill):
             )
             self.index = {}
             return
-        # in-memory cache of already-fetched Gutenberg book pages
-        # (BeautifulSoup), keyed by URL - several stories share the same
-        # book file
-        self._book_soup_cache = {}
+        self._init_story_cache()
         self.index = self._load_index()
         if not self.index:
             self.log.error("No bundled story index found")
@@ -259,52 +531,98 @@ class AndrewLangTales(OVOSSkill):
             self.log.error(f"could not read bundled story index {path}: {e}")
             return {}
 
-    def _get_book_soup(self, url):
-        if url in self._book_soup_cache:
-            return self._book_soup_cache[url]
+    def _init_story_cache(self, directory=None):
+        """Where fetched story text is kept - see StoryCache."""
+        self._story_cache = StoryCache(
+            directory or os.path.join(get_xdg_cache_save_path(), "skills", self.skill_id), self.log)
+        self._fetch_lock = threading.Lock()
+        # a book URL, or 'URL#anchor' for a story its page did not yield
+        # -> (time.monotonic() of the failure, what failed)
+        self._failures = {}
+
+    def _check_backoff(self, key):
+        failure = self._failures.get(key)
+        if failure is None:
+            return
+        when, what = failure
+        wait = FAILURE_BACKOFF - (time.monotonic() - when)
+        if wait > 0:
+            raise StoryFetchError(f"{what} (not trying again for {int(wait)} s)")
+        del self._failures[key]
+
+    def _download(self, url, last_modified=None):
+        """(the page's bytes, its Last-Modified), or (None, last_modified)
+        when it has not changed since last_modified."""
+        headers = {"User-Agent": USER_AGENT}
+        if last_modified:
+            headers["If-Modified-Since"] = last_modified
         try:
-            r = requests.get(url, timeout=15)
+            r = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT)
+            if r.status_code == 304 and last_modified:
+                return None, last_modified
             r.raise_for_status()
-            r.encoding = r.apparent_encoding
-            soup = BeautifulSoup(r.text, "html.parser")
         except requests.RequestException as e:
             raise StoryFetchError(f"failed to fetch {url}: {e}") from e
-        self._book_soup_cache[url] = soup
-        return soup
+        return r.content, r.headers.get("Last-Modified")
+
+    def _fetch_book(self, url, anchor, stale=None):
+        """Fetch one book and cache every story of it in the index (and
+        the one at `anchor`). Given a stale cached story, ask with its
+        Last-Modified: a 304 renews every story cached from that same
+        page, and nothing is downloaded."""
+        self._check_backoff(url)
+        last_modified = stale.get("last_modified") if stale else None
+        try:
+            content, last_modified = self._download(url, last_modified)
+        except StoryFetchError as e:
+            self._failures[url] = (time.monotonic(), str(e))
+            raise
+        now = time.time()
+        anchors = [e["anchor"] for e in self.index.values() if e["url"] == url]
+        if anchor not in anchors:
+            anchors.append(anchor)
+        if content is None:
+            renewed = (self._story_cache.get(url, a) for a in anchors)
+            self._story_cache.put([dict(r, fetched_at=now) for r in renewed
+                                   if r and r.get("last_modified") == last_modified])
+            return
+        stories, errors = extract_book(content, anchors)
+        self._story_cache.put([
+            {"format": CACHE_FORMAT, "url": url, "anchor": a, "fetched_at": now,
+             "last_modified": last_modified, "paragraphs": paragraphs}
+            for a, paragraphs in stories.items()])
+        for a, error in errors.items():
+            self.log.error(f"{url}#{a}: {error}")
+            self._failures[f"{url}#{a}"] = (time.monotonic(), f"{error} in {url}")
 
     def get_story_paragraphs(self, entry):
-        """Extract a single story's paragraphs from its Project Gutenberg
-        book page. Different Gutenberg transcriptions use different anchor
-        schemes ('<a id="link...">' before the <h2> title, '<a name="link...">'
-        nested inside it, or plain '<a id="chapNN">'), and some stories
-        (e.g. 'A Voyage to Lilliput') contain their own nested sub-chapter
-        anchors - so rather than guessing a prefix, we stop collecting
-        paragraphs at the next anchor that's a *different story in this
-        same book* per our own index, whatever its id/name actually is."""
-        soup = self._get_book_soup(entry["url"])
-        anchor = entry["anchor"]
-        anchor_tag = soup.find(id=anchor) or soup.find(attrs={"name": anchor})
-        if anchor_tag is None:
-            raise StoryFetchError(f"anchor {anchor} not found in {entry['url']}")
-
-        other_anchors = {
-            e["anchor"] for e in self.index.values()
-            if e["url"] == entry["url"] and e["anchor"] != anchor
-        }
-
-        paragraphs = []
-        for el in anchor_tag.find_all_next():
-            if el.name == "a":
-                el_anchor = el.get("id") or el.get("name") or ""
-                if el_anchor in other_anchors:
-                    break
-            if el.name == "p":
-                text = el.get_text(" ", strip=True)
-                if text:
-                    paragraphs.append(text)
-        if not paragraphs:
-            raise StoryFetchError(f"no story text found at {entry['url']}#{anchor}")
-        return paragraphs
+        """A story's paragraphs: from the cache when it has them, else by
+        fetching the story's book - once for all the stories in it, see
+        extract_book(). A copy cached longer ago than CACHE_MAX_AGE is
+        still read when the book cannot be fetched again."""
+        url, anchor = entry["url"], entry["anchor"]
+        record = self._story_cache.get(url, anchor)
+        if record and self._story_cache.is_fresh(record):
+            return record["paragraphs"]
+        with self._fetch_lock:
+            # a request for another story of the same book may have
+            # fetched it while this one waited
+            record = self._story_cache.get(url, anchor)
+            if record and self._story_cache.is_fresh(record):
+                return record["paragraphs"]
+            try:
+                self._check_backoff(f"{url}#{anchor}")
+                self._fetch_book(url, anchor, record)
+            except StoryFetchError as e:
+                if record:
+                    self.log.warning(f"{e} - reading the copy cached {time.ctime(record['fetched_at'])}")
+                    return record["paragraphs"]
+                raise
+            record = self._story_cache.get(url, anchor)
+        if record is None:
+            failure = self._failures.get(f"{url}#{anchor}")
+            raise StoryFetchError(failure[1] if failure else f"no story text at {url}#{anchor}")
+        return record["paragraphs"]
 
     def _matches_collection_hint(self, hint):
         if not hint:

@@ -1,13 +1,11 @@
-"""Tests for get_story_paragraphs() against a saved HTML fragment shaped
-like a real Project Gutenberg book page - deliberately not hitting the
-live site in CI."""
-import requests
+"""Tests for extract_book() against HTML fragments shaped like a real
+Project Gutenberg book page - deliberately not hitting the live site in
+CI. test_text_cleanup.py runs it on cut-down real pages."""
 import pytest
-from bs4 import BeautifulSoup
 
-from conftest import StoryFetchError
+from conftest import extract_book
 
-BOOK_HTML = """
+BOOK_HTML = b"""
 <html><body>
 <a href="#link2H_4_0006"> An Earlier Tale </a>
 <a id="link2H_4_0007">
@@ -23,14 +21,15 @@ BOOK_HTML = """
 </body></html>
 """
 
-MISSING_ANCHOR_HTML = "<html><body><p>no anchors here</p></body></html>"
+MISSING_ANCHOR_HTML = b"<html><body><p>no anchors here</p></body></html>"
 
 # Regression fixture for a real bug: 'A Voyage to Lilliput' contains its own
 # nested sub-chapter anchors (link2HCH0001, ...) *inside* the story, before
 # any <p> text - a naive "stop at the next <a id='link...'>" rule breaks
 # immediately and returns zero paragraphs. We must only stop at anchors that
-# belong to *other stories* per self.index, not any 'link'-prefixed anchor.
-NESTED_ANCHOR_HTML = """
+# belong to *other stories* per self.index, not any 'link'-prefixed anchor -
+# and its chapter headings are <h2>s that do not end it either.
+NESTED_ANCHOR_HTML = b"""
 <html><body>
 <a id="link2H_4_0032"><!--  H2 anchor --> </a>
 <h2>A VOYAGE TO LILLIPUT</h2>
@@ -47,54 +46,44 @@ NESTED_ANCHOR_HTML = """
 """
 
 
-def test_get_story_paragraphs(skill, monkeypatch):
-    monkeypatch.setattr(skill, "_get_book_soup", lambda url: BeautifulSoup(BOOK_HTML, "html.parser"))
-    url = "http://example.test/book.htm"
-    # get_story_paragraphs finds the *next* story's boundary via self.index,
-    # so both stories sharing this book file need to be registered there -
-    # mirrors how the real bundled index.json is structured.
-    skill.index = {
-        "Cinderella, Or The Little Glass Slipper": {"url": url, "anchor": "link2H_4_0007", "book": "Blue Fairy Book"},
-        "The Next Story": {"url": url, "anchor": "link2H_4_0008", "book": "Blue Fairy Book"},
-    }
-    entry = skill.index["Cinderella, Or The Little Glass Slipper"]
-    paragraphs = skill.get_story_paragraphs(entry)
-    assert paragraphs == [
+def test_extract_book():
+    stories, errors = extract_book(BOOK_HTML, ["link2H_4_0007", "link2H_4_0008"])
+    assert errors == {}
+    assert stories["link2H_4_0007"] == [
         "Once there was a gentleman who married a proud woman.",
         "She had two daughters of her own humour.",
     ]
+    assert stories["link2H_4_0008"] == [
+        "This text belongs to the next story and must not be included.",
+    ]
 
 
-def test_get_story_paragraphs_missing_anchor_raises(skill, monkeypatch):
-    monkeypatch.setattr(skill, "_get_book_soup", lambda url: BeautifulSoup(MISSING_ANCHOR_HTML, "html.parser"))
-    entry = {"url": "http://example.test/book.htm", "anchor": "link2H_4_9999", "book": "Blue Fairy Book"}
-    with pytest.raises(StoryFetchError):
-        skill.get_story_paragraphs(entry)
+def test_extract_book_missing_anchor_is_an_error_for_that_story_only():
+    stories, errors = extract_book(MISSING_ANCHOR_HTML, ["link2H_4_9999"])
+    assert stories == {}
+    assert "link2H_4_9999" in errors["link2H_4_9999"]
 
 
-def test_get_book_soup_caches_and_wraps_request_exception(skill, monkeypatch):
-    calls = []
-
-    def fake_get(url, timeout):
-        calls.append(url)
-        raise requests.ConnectionError("boom")
-
-    monkeypatch.setattr(requests, "get", fake_get)
-    with pytest.raises(StoryFetchError):
-        skill._get_book_soup("http://example.test/down.htm")
-    assert len(calls) == 1
-
-
-def test_get_story_paragraphs_ignores_nested_sub_chapter_anchors(skill, monkeypatch):
-    monkeypatch.setattr(skill, "_get_book_soup", lambda url: BeautifulSoup(NESTED_ANCHOR_HTML, "html.parser"))
-    url = "http://example.test/book.htm"
-    skill.index = {
-        "A Voyage To Lilliput": {"url": url, "anchor": "link2H_4_0032", "book": "Blue Fairy Book"},
-        "The Next Story": {"url": url, "anchor": "link2H_4_0033", "book": "Blue Fairy Book"},
-    }
-    entry = skill.index["A Voyage To Lilliput"]
-    paragraphs = skill.get_story_paragraphs(entry)
-    assert paragraphs == [
+def test_extract_book_ignores_nested_sub_chapter_anchors():
+    stories, errors = extract_book(NESTED_ANCHOR_HTML, ["link2H_4_0032", "link2H_4_0033"])
+    assert stories["link2H_4_0032"] == [
         "My father had a small estate in Nottinghamshire.",
         "The emperor came out of his palace on horseback.",
     ]
+
+
+def test_a_story_without_text_is_an_error():
+    html = b'<a id="a1"></a><h2>ONE</h2><p>(1) Grimm.</p><a id="a2"></a><h2>TWO</h2><p>Once upon a time there was a king.</p>'
+    stories, errors = extract_book(html, ["a1", "a2"])
+    assert "a1" in errors
+    assert stories == {"a2": ["Once upon a time there was a king."]}
+
+
+@pytest.mark.parametrize("encoding_declared", [True, False])
+def test_the_page_is_read_as_utf8_whatever_it_declares(encoding_declared):
+    """Gutenberg sends 'Content-Type: text/html' without a charset, and
+    several of these pages have no <meta charset> either."""
+    head = b'<meta charset="utf-8">' if encoding_declared else b""
+    html = head + '<a id="a1"></a><h2>T</h2><p>Mährchen, fées, “quotes”.</p>'.encode("utf-8")
+    stories, _ = extract_book(html, ["a1"])
+    assert stories["a1"] == ["Mährchen, fées, “quotes”."]
